@@ -1,12 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
-import { createClient } from "@supabase/supabase-js";
 import crypto from "crypto";
+import { Resend } from "resend";
 
-const supabase = createClient(
-  process.env.SUPABASE_URL ?? "",
-  process.env.SUPABASE_SERVICE_ROLE_KEY ?? "",
-  { auth: { persistSession: false } }
-);
+const resend = new Resend(process.env.RESEND_API_KEY ?? "");
+
+const FROM = "SecureVibes <support@securevibes.dev>";
+const TO = "support@securevibes.dev"; // Cloudflare로 Gmail 포워딩됨
 
 const ALLOWED_EVENTS = new Set(["page_view", "audit_waitlist", "scorecard"]);
 const EMAIL_RE = /^[^\s@]{1,64}@[^\s@]{1,189}\.[^\s@]{2,}$/;
@@ -25,6 +24,13 @@ function rateLimited(ip: string): boolean {
   }
   h.n += 1;
   return h.n > MAX_HITS;
+}
+
+function esc(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
 }
 
 export async function POST(req: NextRequest) {
@@ -49,12 +55,14 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ ok: false, error: "bad_event" }, { status: 400 });
     }
 
-    let email: string | null = null;
-    if (event !== "page_view") {
-      email = String(body.email ?? "").trim().toLowerCase();
-      if (!EMAIL_RE.test(email) || email.length > 254) {
-        return NextResponse.json({ ok: false, error: "bad_email" }, { status: 400 });
-      }
+    // page_view는 신호가 아니므로 메일 발송 없이 조용히 통과
+    if (event === "page_view") {
+      return NextResponse.json({ ok: true });
+    }
+
+    let email = String(body.email ?? "").trim().toLowerCase();
+    if (!EMAIL_RE.test(email) || email.length > 254) {
+      return NextResponse.json({ ok: false, error: "bad_email" }, { status: 400 });
     }
 
     let appUrl: string | null = null;
@@ -69,26 +77,43 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    const clean = (v: unknown) => String(v ?? "").slice(0, 100) || null;
+    const clean = (v: unknown) => String(v ?? "").slice(0, 100) || "—";
     const ipHash = crypto
       .createHash("sha256")
       .update(ip + (process.env.IP_SALT ?? "sv"))
       .digest("hex")
       .slice(0, 32);
 
-    const { error } = await supabase.from("fd_events").insert({
-      event,
-      email,
-      app_url: appUrl,
-      utm_source: clean(body.utm_source),
-      utm_campaign: clean(body.utm_campaign),
-      utm_content: clean(body.utm_content),
-      ip_hash: ipHash,
+    const label = event === "audit_waitlist" ? "Claim my spot" : "Free scorecard";
+    const subject =
+      event === "audit_waitlist"
+        ? `[Claim my spot] ${email}`
+        : `[Free scorecard] ${email}`;
+
+    const html = `
+      <h2>New SecureVibes lead — ${esc(label)}</h2>
+      <table cellpadding="6" style="border-collapse:collapse;font-family:monospace;font-size:14px">
+        <tr><td><b>Event</b></td><td>${esc(event)}</td></tr>
+        <tr><td><b>Email</b></td><td>${esc(email)}</td></tr>
+        <tr><td><b>App URL</b></td><td>${esc(appUrl ?? "—")}</td></tr>
+        <tr><td><b>utm_source</b></td><td>${esc(clean(body.utm_source))}</td></tr>
+        <tr><td><b>utm_campaign</b></td><td>${esc(clean(body.utm_campaign))}</td></tr>
+        <tr><td><b>utm_content</b></td><td>${esc(clean(body.utm_content))}</td></tr>
+        <tr><td><b>ip_hash</b></td><td>${esc(ipHash)}</td></tr>
+        <tr><td><b>received</b></td><td>${new Date().toISOString()}</td></tr>
+      </table>
+    `;
+
+    const { error } = await resend.emails.send({
+      from: FROM,
+      to: TO,
+      replyTo: email, // 바로 답장하면 리드에게 감
+      subject,
+      html,
     });
 
-    // 중복 가입(unique 위반)은 성공으로 처리 (멱등)
-    if (error && error.code !== "23505") {
-      console.error("[track] insert error:", error.code, error.message);
+    if (error) {
+      console.error("[track] resend error:", error);
       return NextResponse.json({ ok: false, error: "server_error" }, { status: 500 });
     }
 
